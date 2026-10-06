@@ -11,6 +11,7 @@
 4. It records a `system` conversation activity with `detail.event = "render"` on the turn that is running. This is the same discriminator pattern `steer` and `context.reset` use, so there is no migration and no new activity kind.
 5. The renderer shows that activity as an `<iframe sandbox="allow-scripts allow-forms">` pointing at `GET /api/v1/sessions/{id}/renders/{renderId}`.
 6. That route also sends `Content-Security-Policy: sandbox allow-scripts allow-forms`. The page therefore has an opaque origin wherever it is opened, and the daemon's CORS middleware refuses its `Origin: null` requests.
+7. Before publishing, the agent can run `ao render --check <file>`. The daemon stores a temporary `check-` render, and the desktop app loads it in a hidden, in-memory-partition `WebContentsView` through the existing browser-runtime socket. The agent gets a PNG, the content height, and the console messages.
 
 **Tech Stack:** Go (chi, cobra, existing sqlite store), React 19 + Tailwind v4 + shadcn primitives, react-i18next, Electron 33, vitest + Testing Library.
 
@@ -25,7 +26,7 @@
 | T3 Code piece | T3 file | AO equivalent (this plan) |
 |---|---|---|
 | `html_render` MCP tool on T3's own MCP server | `apps/server/src/mcp/toolkits/html/tools.ts`, `handlers.ts` | `ao render` CLI → `POST /api/v1/sessions/{id}/renders` (Task 5, Task 4). AO injects no MCP server into agents; they learn `ao` from the `using-ao` skill. |
-| `html_preview` (PNG, `contentHeight`, console) + pinned Chrome-for-Testing download (~120 MB) + SOCKS public-only proxy (~1.3k loc) | `apps/server/src/htmlRender/{PreviewBrowser,headlessChrome,publicProxy}.ts` | **Deferred (Phase 2).** AO already ships Electron and an `ao browser` broker, so a check can run offscreen with no download. |
+| `html_preview` (PNG, `contentHeight`, console) + pinned Chrome-for-Testing download (~120 MB) + SOCKS public-only proxy (~1.3k loc) | `apps/server/src/htmlRender/{PreviewBrowser,headlessChrome,publicProxy}.ts` | `ao render --check` (Task 8). It runs in a hidden Electron view through the existing `ao browser` path, so it needs no download and no proxy. |
 | Page stored as a thread attachment; bootstrap injected into `<head>` | `apps/server/src/htmlRender/HtmlRender.ts`, `packages/shared/src/htmlRender.ts` | `attachmentstore.PutRender` (Task 1) + `injectRenderBootstrap` (Task 2) |
 | Tool result `{attachmentId,title,height,heights}` → timeline row `html-render` | `apps/web/src/session-logic.ts`, `components/chat/MessagesTimeline.*` | A `system` activity with `detail.event:"render"` (Task 3). It renders through a new `ActivityRow` branch (Task 6). `runsOf` already keeps evented activities out of tool-call runs (`ChatWorkspace.tsx:1593`). |
 | Sandboxed iframe; theme passed in a `#t3-theme=` fragment and then via `ui/notifications/host-context-changed`; auto-height via `ui/notifications/size-changed`; links via `ui/open-link` (MCP Apps JSON-RPC over postMessage) | `apps/web/src/components/chat/HtmlRenderFrame.tsx`, `components/files/BrowserDocumentFrame.tsx` | `RenderFrame.tsx` (Task 6). It uses the same three protocol methods and an `#ao-theme=` fragment. |
@@ -40,7 +41,7 @@
 3. **Reuse `ErrNoActiveTurn`.** `awaitAcknowledgedTurn` (`controller.go:2334`) already answers "is a turn in flight". Steer reuses the same sentinel, so renders do too.
 4. **Daemon origin plus a CSP sandbox, never the preview origin.** `ao-preview.<id>.localhost` is a loopback origin, and `corsMiddleware` deliberately lets it call the daemon API (`httpd/cors.go`). A render must have an opaque origin; `exactAllowedOrigins` excludes `null`, so the daemon answers it with 403. Render files therefore use a `render-` prefix that `attachmentstore.validateName` rejects. As a result `previewFile`, `MaterializeWorkspace` and `ImportWorkspace` can never serve or project them.
 5. **Bootstrap goes after the doctype, not inside `<head>`.** Go's RE2 has no backreferences, so T3's raw-text scanner can't be ported. `golang.org/x/net/html` isn't a dependency either. Under the HTML parsing algorithm, a `<style>` or `<script>` right after the doctype opens the implied `<head>`. The page's own `<html>` start tag then merges its attributes, and its `<head>` start tag is ignored as a parse error. Leading BOM, whitespace and comments are skipped so the page never drops into quirks mode.
-6. **The always-on prompt gets a 6-word pointer.** `aoSkillPointer` is 213 words against a 220-word cap enforced at `manager_test.go:5603`. The rules live in `ao render --help` and `commands/render.md`, the same pattern `ao preview` follows.
+6. **The always-on prompt gets two sentences, and its cap rises from 220 to 260 words.** This was a user decision on 2026-10-06. `aoSkillPointer` is 213 words today, and the cap is enforced at `manager_test.go:5603`. The two sentences tell agents when to use `ao render` and where its guide is. They pass the ASD-STE100 structural linter. The detailed rules stay in `commands/render.md` and `ao render --help`.
 7. **Theme is read from AO's semantic tokens at runtime.** These are `--color-bg-primary`, `--color-text-primary` and the rest, defined in `frontend/src/styles/tokens.css`, which DESIGN.md §6 names as the source of truth. `getComputedStyle` resolves their `var()` chains.
 8. **Chat sessions only.** In a TUI session the CLI gets `SESSION_MODE_MISMATCH` and points the agent at `ao preview`.
 
@@ -49,9 +50,12 @@
 - Page scripts run in the renderer process inside an opaque-origin frame. They can fetch public URLs and other loopback/LAN services, but not the AO daemon (403 on `Origin: null`). The existing workspace preview is strictly more privileged.
 - A page can take keyboard focus by script. Links open externally only while the frame has focus and user activation is live (`navigator.userActivation.isActive`).
 
-### Open decisions for the user
+### Decided with the user (2026-10-06)
 
-- **Chart palette.** DESIGN.md §6 forbids one-off hex in app UI. AO's existing `--chart-1…5` tokens are grayscale, and the status colors carry meaning. Task 6 sends agent pages one categorical series: `--chart-1` comes from `--color-brand-logo`, followed by 5 fixed hues per theme (T3's values). These colors reach agent pages only, never AO chrome. Approve the values or name tokens to use instead.
+- **Chart palette: five fixed colors per theme.** DESIGN.md §6 forbids one-off hex in app UI. AO's `--chart-1…5` tokens are grayscale, and the status colors carry session meaning. So `--chart-1` comes from `--color-brand-logo` and `--chart-2…6` are T3's five fixed hues per theme. These colors reach agent pages only, never AO chrome.
+- **Execution: subagent-driven.**
+- **Prompt: two sentences, cap raised to 260 words** (decision 6).
+- **Self-check is in scope** (`ao render --check`), not Phase 2. It was offered as "Task 9". It became Task 8 so that real-app verification (Task 9) stays last.
 
 ---
 
@@ -67,7 +71,7 @@
   - Title is trimmed, non-empty, and ≤ 200 runes.
   - Height is clamped to 80–2000 CSS px.
 - UI is built from shadcn primitives (`components/ui/button.tsx`, `components/ui/dialog.tsx`, `components/ui/tooltip.tsx`) and Lucide icons at 14px, per DESIGN.md §9. Every user-visible string goes through `t()`, with keys in all 8 locale files under `frontend/src/renderer/i18n/`.
-- `aoSkillPointer()` stays ≤ 220 words (`manager_test.go:5603`).
+- `aoSkillPointer()` stays ≤ 260 words. Task 5 raises the cap at `manager_test.go:5603` from 220.
 - Conventional commits, one PR, branch `feat/inline-html-renders`.
 
 ## Review Focus
@@ -98,13 +102,15 @@
 | `backend/internal/httpd/api.go:190` (modify) | Wire `Renders` |
 | `backend/internal/cli/render.go` (new), `root.go:210` (modify) | `ao render` |
 | `backend/internal/skillassets/using-ao/commands/render.md` (new), `SKILL.md` (modify) | Agent guide + catalog row |
-| `backend/internal/session_manager/manager.go:4965` (modify) | 6-word pointer |
+| `backend/internal/session_manager/manager.go:4965`, `manager_test.go:5603` (modify) | "Showing pages in chat" section; cap 220 → 260 |
 | `frontend/src/renderer/lib/render-frame.ts` (new) | Pure helpers: detail parsing, theme, protocol messages |
 | `frontend/src/renderer/components/chat/RenderFrame.tsx` (new) | Inline frame, fit-to-content, expand dialog |
 | `frontend/src/renderer/components/chat/ChatTimelineItems.tsx:850-864` (modify) | `ActivityRow` branch |
 | `frontend/src/renderer/types/conversation.ts:397` (modify) | `"render"` event + `render?: RenderRef` |
 | `frontend/src/renderer/i18n/*.json` (modify, 8 files) | `chat.render.expand` |
 | `frontend/src/main/render-frame-guard.ts` (new), `frontend/src/main.ts:703` (modify) | Block a render frame from navigating away |
+| `frontend/src/main/render-check.ts` (new), `frontend/src/main.ts:1327` (modify) | Hidden-view page check for `__render-check` |
+| `backend/internal/service/chat/render.go`, `daemon/daemon.go`, `controllers/conversation_render.go` (modify, Task 8) | `CheckRender`, broker wiring, `POST …/renders/check` |
 
 ---
 
@@ -1168,8 +1174,9 @@ git commit -m "feat(api): publish and serve sandboxed agent HTML renders"
 - Modify: `backend/internal/cli/root.go:210`. Add `root.AddCommand(newRenderCommand(ctx))` after `newPreviewCommand`.
 - Create: `backend/internal/skillassets/using-ao/commands/render.md`
 - Modify: `backend/internal/skillassets/using-ao/SKILL.md`. Add a catalog row after `preview`.
-- Modify: `backend/internal/session_manager/manager.go:4972`. Add the 6-word pointer.
-- Test: `backend/internal/cli/render_test.go` (`package cli`); the existing `manager_test.go:5603` cap
+- Modify: `backend/internal/session_manager/manager.go:4965-4978`. Add a "Showing pages in chat" section to `aoSkillPointer`.
+- Modify: `backend/internal/session_manager/manager_test.go:5590-5605`. Raise the cap from 220 to 260 and assert the new sentence.
+- Test: `backend/internal/cli/render_test.go` (`package cli`)
 
 **Interfaces:**
 - Consumes: `POST sessions/{id}/renders` (Task 4). Existing CLI helpers: `commandContext.postJSON`, `usageError`, and the test helpers `executeCLI`, `setConfigEnv`, `writeRunFileFor`, `previewCapture` (in `preview_test.go`).
@@ -1439,16 +1446,29 @@ roughly how it looks (without the theme variables).
 | `render` | Show a self-contained HTML page inline in a chat thread | Answering with a chart, table, diagram, or mockup | [commands/render.md](commands/render.md) |
 ```
 
-- [ ] **Step 5: Add the pointer to `aoSkillPointer`** (`manager.go:4972`). Append it to the end of the "Using the ao CLI" sentence:
+- [ ] **Step 5: Add the section to `aoSkillPointer` and raise its cap**
+
+In `manager.go`, add `renderFile := filepath.ToSlash(filepath.Join(dir, "commands", "render.md"))` next to `previewFile`. Then append a section after the Browser panel paragraph. Change the current last line, ``"`ao browser` operates the same live page the user sees in that panel."``, to:
 
 ```go
-		"When using `ao`, read `" + skillFile + "` and only the relevant file under `" + commandsGlob + "`; do not load unrelated command guides. Inline chat charts/tables: `ao render --help`.\n\n" +
+		"`ao browser` operates the same live page the user sees in that panel.\n\n" +
+		"## Showing pages in chat\n\n" +
+		"In a chat session, use `ao render` when a chart, table, diagram, or mockup is clearer than text. " +
+		"Read `" + renderFile + "` before you use `ao render`."
 ```
+
+In `manager_test.go`, add `"use `ao render` when a chart, table, diagram, or mockup is clearer than text"` to the `want` list at line 5590. Raise the cap at line 5603:
+
+```go
+	if words := len(strings.Fields(m.aoSkillPointer())); words > 260 {
+```
+
+The new section is 30 words, so the pointer goes from 213 to about 243.
 
 - [ ] **Step 6: Run the suites**
 
-Run: `cd backend && go test ./internal/cli/ ./internal/skillassets/ ./internal/session_manager/ -run 'Render|Skill|SystemPrompt|Pointer'`
-Expected: PASS. If the 220-word cap fails because `main` grew the pointer, use `Chat visuals: \`ao render --help\`.` (4 words) instead. Then run the full packages: `go test ./internal/cli/ ./internal/skillassets/ ./internal/session_manager/` and expect PASS. If a CLI command-catalog golden or docs test flags `render`, update it as that test instructs.
+Run: `cd backend && go test ./internal/cli/ ./internal/skillassets/ ./internal/session_manager/`
+Expected: PASS. If a CLI command-catalog golden or a docs test flags `render`, update it as that test instructs.
 
 - [ ] **Step 7: Commit**
 
@@ -2010,7 +2030,765 @@ git commit -m "feat(desktop): keep agent render frames on their own page"
 
 ---
 
-### Task 8: Real-app verification and the CI suites
+### Task 8: `ao render --check`: screenshot, console, and height from a hidden Electron view
+
+The agent checks a page before it publishes it. This is AO's version of T3's `html_preview`. It uses the running desktop app instead of a downloaded Chrome:
+
+1. The CLI posts the HTML to the daemon.
+2. The daemon stores it as a temporary render `check-<id>`. Task 1 storage and the Task 2 bootstrap apply, so the check sees exactly what readers will see.
+3. The daemon asks Electron, through the existing browser-runtime socket, to load that render URL in a hidden view.
+4. Electron returns a PNG, the content height, and the console messages.
+5. The daemon deletes the temporary file.
+
+The check uses the app's current light/dark mode, because Electron views follow the app theme (`main.ts:2028`). It needs no running turn. It needs the desktop app, and without it the agent gets `503 RENDER_CHECK_UNAVAILABLE`.
+
+**Files:**
+- Modify: `backend/internal/service/chat/render.go`. Add `CheckRender`, the `RenderCheck` port, and the types.
+- Modify: `backend/internal/service/chat/service.go`. Add a `renderCheck RenderCheck` field to `Service`. `SetRenderCheck` sets it.
+- Modify: `backend/internal/daemon/daemon.go:404`. Wire `RenderCheck` to `browserBroker.Execute` (the broker is built at `daemon.go:206`).
+- Modify: `backend/internal/httpd/controllers/conversation_render.go`, `conversations.go` (one route), `dto.go`, `apispec/specgen/build.go`
+- Modify: `backend/internal/cli/render.go` (`--check`, `--width`, `--out`), `skillassets/using-ao/commands/render.md`
+- Create: `frontend/src/main/render-check.ts`
+- Modify: `frontend/src/main.ts:1327`. Route `__render-check` to `checkRender` before `browserViewHost`.
+- Test: `backend/internal/service/chat/render_test.go`, `backend/internal/httpd/controllers/conversation_render_test.go`, `backend/internal/cli/render_test.go`, `frontend/src/main/render-check.test.ts`
+
+**Interfaces:**
+- Consumes: `(*attachmentstore.Store).PutRender/RemoveRender` (Task 1), `injectRenderBootstrap` (Task 2), `Service.renders`/`requireChatSession` (Task 3), `renderPublisher`/`writeConversationError`/`decodeConversationBody` (Task 4), `publishRender` command plumbing (Task 5). Existing: `(*browserruntime.Broker).Execute(ctx, domain.SessionID, string, map[string]interface{}) (browserruntime.Result, error)` (`broker.go:158`), `browserruntime.ErrUnavailable` (`broker.go:59`), `writeBrowserScreenshot(cmd, result map[string]any, target string, jsonOutput, annotate bool) error` (`cli/browser.go:990`).
+- Produces (Go):
+  - `type RenderCheck func(ctx context.Context, id domain.SessionID, args map[string]any) (any, error)`
+  - `var ErrRenderCheckUnavailable = errors.New("render check needs the AO desktop app")`
+  - `type RenderCheckInput struct { HTML string; Width int; BaseURL string }`
+  - `type RenderConsoleMessage struct { Level, Text string }` (JSON `level`, `text`)
+  - `type RenderCheckResult struct { PNG string; Width, Height, ContentHeight int; ConsoleMessages []RenderConsoleMessage }`
+  - `func (s *Service) CheckRender(ctx context.Context, id domain.SessionID, in RenderCheckInput) (RenderCheckResult, error)`
+- Produces (wire): `POST /api/v1/sessions/{sessionId}/renders/check` with `{"html","width"}`. It returns `200 {"screenshot":{"mimeType":"image/png","data","width","height"},"contentHeight","consoleMessages":[{"level","text"}]}`, `400 RENDER_INVALID`, `503 RENDER_CHECK_UNAVAILABLE`, or `409 SESSION_MODE_MISMATCH`.
+- Produces (broker action): `__render-check` with args `{"url": "http://127.0.0.1:<port>/api/v1/sessions/<id>/renders/check-<id>", "width": N}`. The result is `{"data": base64 PNG, "width", "height", "contentHeight", "consoleMessages": [{"level": "debug"|"log"|"warning"|"error", "text"}]}`. Like `__destroy-session`, it is internal: it is not in the `service/browser` allowlist, so `ao browser` cannot send it.
+- Produces (CLI): `ao render --check <file> [--width N] [--out file.png]`
+
+- [ ] **Step 1: Write the failing Go service test** (append to `render_test.go`)
+
+```go
+func TestCheckRenderLoadsTheStoredPageAndDeletesIt(t *testing.T) {
+	h := newHarnessForHarness(t, domain.HarnessCodex)
+	var gotArgs map[string]any
+	var pageDuringCheck []byte
+	h.svc.SetRenderCheck(func(ctx context.Context, id domain.SessionID, args map[string]any) (any, error) {
+		gotArgs = args
+		renderID := strings.TrimPrefix(args["url"].(string), "http://127.0.0.1:3001/api/v1/sessions/"+string(id)+"/renders/")
+		file, _, err := h.renders.OpenRender(ctx, id, renderID)
+		if err != nil {
+			t.Fatalf("page not stored during the check: %v", err)
+		}
+		pageDuringCheck, _ = io.ReadAll(file)
+		_ = file.Close()
+		return map[string]any{
+			"data": "iVBORw0KGgo=", "width": 720.0, "height": 412.0, "contentHeight": 412.0,
+			"consoleMessages": []any{map[string]any{"level": "error", "text": "Uncaught ReferenceError: d3 is not defined"}},
+		}, nil
+	})
+
+	result, err := h.svc.CheckRender(context.Background(), testSession, chatsvc.RenderCheckInput{
+		HTML: "<p>chart</p>", BaseURL: "http://127.0.0.1:3001",
+	})
+	if err != nil {
+		t.Fatalf("CheckRender: %v", err)
+	}
+	if !strings.HasPrefix(gotArgs["url"].(string), "http://127.0.0.1:3001/api/v1/sessions/"+string(testSession)+"/renders/check-") || gotArgs["width"] != 720 {
+		t.Fatalf("args = %v", gotArgs)
+	}
+	if !strings.Contains(string(pageDuringCheck), `<style id="ao-theme">`) {
+		t.Fatal("the check did not see the bootstrapped page readers get")
+	}
+	if result.ContentHeight != 412 || result.PNG != "iVBORw0KGgo=" || len(result.ConsoleMessages) != 1 || result.ConsoleMessages[0].Level != "error" {
+		t.Fatalf("result = %+v", result)
+	}
+	entries, _ := os.ReadDir(filepath.Join(h.rendersDir, "attachments", string(testSession)))
+	if len(entries) != 0 {
+		t.Fatalf("check left files behind: %v", entries)
+	}
+}
+
+func TestCheckRenderWithoutTheDesktopAppSaysSo(t *testing.T) {
+	h := newHarnessForHarness(t, domain.HarnessCodex)
+	h.svc.SetRenderCheck(func(context.Context, domain.SessionID, map[string]any) (any, error) {
+		return nil, chatsvc.ErrRenderCheckUnavailable
+	})
+	_, err := h.svc.CheckRender(context.Background(), testSession, chatsvc.RenderCheckInput{HTML: "<p>x</p>", BaseURL: "http://127.0.0.1:3001"})
+	if !errors.Is(err, chatsvc.ErrRenderCheckUnavailable) {
+		t.Fatalf("err = %v, want ErrRenderCheckUnavailable", err)
+	}
+	if _, err := h.svc.CheckRender(context.Background(), testSession, chatsvc.RenderCheckInput{HTML: "<p>x</p>", Width: 100}); !errors.Is(err, chatsvc.ErrRenderInvalid) {
+		t.Fatalf("width 100: err = %v, want ErrRenderInvalid", err)
+	}
+}
+```
+
+`SetRenderCheck` is a post-construction setter, like the existing `SetReportCoordinator` (`service.go:66`). The harness does not have to change its `chatsvc.New` call.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `cd backend && go test ./internal/service/chat/ -run CheckRender -v`
+Expected: FAIL to compile, with `h.svc.SetRenderCheck undefined`.
+
+- [ ] **Step 3: Implement in `render.go`**
+
+```go
+const (
+	defaultRenderCheckWidth = 720
+	minRenderCheckWidth     = 240
+	maxRenderCheckWidth     = 1600
+	renderCheckAction       = "__render-check"
+)
+
+// ErrRenderCheckUnavailable reports that no desktop app is connected to load the page.
+var ErrRenderCheckUnavailable = errors.New("render check needs the AO desktop app")
+
+// RenderCheck asks the desktop app to load a render URL in a hidden view. The
+// daemon wires it to the browser-runtime broker.
+type RenderCheck func(ctx context.Context, id domain.SessionID, args map[string]any) (any, error)
+
+// RenderCheckInput is a page an agent wants to see before it publishes it.
+// BaseURL is the daemon origin the desktop app can load, e.g. http://127.0.0.1:3001.
+type RenderCheckInput struct {
+	HTML    string
+	Width   int
+	BaseURL string
+}
+
+// RenderConsoleMessage is one console line the page wrote while it loaded.
+type RenderConsoleMessage struct {
+	Level string `json:"level"`
+	Text  string `json:"text"`
+}
+
+// RenderCheckResult is what the page looked like at the requested width.
+type RenderCheckResult struct {
+	PNG             string                 `json:"data"`
+	Width           int                    `json:"width"`
+	Height          int                    `json:"height"`
+	ContentHeight   int                    `json:"contentHeight"`
+	ConsoleMessages []RenderConsoleMessage `json:"consoleMessages"`
+}
+
+// SetRenderCheck installs the desktop-app page loader after daemon wiring.
+func (s *Service) SetRenderCheck(check RenderCheck) {
+	s.renderCheck = check
+}
+
+// CheckRender shows the agent its page as readers will see it: the same
+// stored, bootstrapped document, loaded by the desktop app in a hidden view.
+func (s *Service) CheckRender(ctx context.Context, id domain.SessionID, in RenderCheckInput) (RenderCheckResult, error) {
+	width := in.Width
+	if width == 0 {
+		width = defaultRenderCheckWidth
+	}
+	switch {
+	case strings.TrimSpace(in.HTML) == "":
+		return RenderCheckResult{}, fmt.Errorf("%w: the page is empty", ErrRenderInvalid)
+	case len(in.HTML) > maxRenderHTMLBytes:
+		return RenderCheckResult{}, fmt.Errorf("%w: the page is %d bytes; the limit is %d", ErrRenderInvalid, len(in.HTML), maxRenderHTMLBytes)
+	case width < minRenderCheckWidth || width > maxRenderCheckWidth:
+		return RenderCheckResult{}, fmt.Errorf("%w: width must be %d-%d", ErrRenderInvalid, minRenderCheckWidth, maxRenderCheckWidth)
+	case s.renders == nil || s.renderCheck == nil:
+		return RenderCheckResult{}, ErrRenderCheckUnavailable
+	}
+	if _, err := s.requireChatSession(ctx, id); err != nil {
+		return RenderCheckResult{}, err
+	}
+	renderID := "check-" + s.newID()
+	if err := s.renders.PutRender(ctx, id, renderID, []byte(injectRenderBootstrap(in.HTML))); err != nil {
+		return RenderCheckResult{}, fmt.Errorf("store render check: %w", err)
+	}
+	defer func() {
+		if err := s.renders.RemoveRender(context.WithoutCancel(ctx), id, renderID); err != nil {
+			s.log.Warn("render check cleanup failed", "session", id, "render", renderID, "error", err)
+		}
+	}()
+	pageURL := strings.TrimRight(in.BaseURL, "/") +
+		"/api/v1/sessions/" + url.PathEscape(string(id)) + "/renders/" + url.PathEscape(renderID)
+	value, err := s.renderCheck(ctx, id, map[string]any{"url": pageURL, "width": width})
+	if err != nil {
+		return RenderCheckResult{}, err
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return RenderCheckResult{}, fmt.Errorf("encode render check result: %w", err)
+	}
+	var result RenderCheckResult
+	if err := json.Unmarshal(encoded, &result); err != nil || result.PNG == "" {
+		return RenderCheckResult{}, fmt.Errorf("desktop app returned an unreadable render check: %v", err)
+	}
+	return result, nil
+}
+```
+
+The JSON round trip turns the broker's `float64` numbers into `int` fields. Go encodes `720.0` as `720`.
+
+Add `renderCheck RenderCheck` to `Service` (`service.go:37`). In `daemon.go`, right after `chatSvc := chatsvc.New(...)` (line 404):
+
+```go
+	chatSvc.SetRenderCheck(func(ctx context.Context, id domain.SessionID, args map[string]any) (any, error) {
+		result, err := browserBroker.Execute(ctx, id, "__render-check", args)
+		if errors.Is(err, browserruntime.ErrUnavailable) {
+			return nil, chatsvc.ErrRenderCheckUnavailable
+		}
+		return result.Value, err
+	})
+```
+
+- [ ] **Step 4: Run the Go service tests**
+
+Run: `cd backend && go test -race ./internal/service/chat/ -run 'CheckRender|PublishRender' -v`
+Expected: PASS.
+
+- [ ] **Step 5: Write the failing HTTP test** (append to `conversation_render_test.go`)
+
+```go
+type renderCheckStub struct {
+	*renderStub
+	checkInput chatsvc.RenderCheckInput
+	checkErr   error
+}
+
+func (s *renderCheckStub) CheckRender(_ context.Context, _ domain.SessionID, in chatsvc.RenderCheckInput) (chatsvc.RenderCheckResult, error) {
+	s.checkInput = in
+	return chatsvc.RenderCheckResult{PNG: "iVBORw0KGgo=", Width: 720, Height: 412, ContentHeight: 412,
+		ConsoleMessages: []chatsvc.RenderConsoleMessage{{Level: "error", Text: "boom"}}}, s.checkErr
+}
+
+func TestRenderCheckRouteReturnsTheScreenshotAndNamesTheOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"ok", nil, http.StatusOK, ""},
+		{"no desktop app", chatsvc.ErrRenderCheckUnavailable, http.StatusServiceUnavailable, "RENDER_CHECK_UNAVAILABLE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &renderCheckStub{renderStub: &renderStub{fakeConversationService: &fakeConversationService{}}, checkErr: tc.err}
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{DataDir: t.TempDir()}, log, nil, httpd.APIDeps{
+				Sessions: newFakeSessionService(), Conversations: svc,
+			}, httpd.ControlDeps{}))
+			t.Cleanup(srv.Close)
+
+			resp, err := http.Post(srv.URL+"/api/v1/sessions/proj-1/renders/check", "application/json",
+				strings.NewReader(`{"html":"<p>x</p>","width":390}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			var body struct {
+				Code       string `json:"code"`
+				Screenshot struct {
+					MimeType string `json:"mimeType"`
+					Data     string `json:"data"`
+				} `json:"screenshot"`
+				ContentHeight int `json:"contentHeight"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&body)
+			if resp.StatusCode != tc.status || body.Code != tc.code {
+				t.Fatalf("status=%d code=%q, want %d %q", resp.StatusCode, body.Code, tc.status, tc.code)
+			}
+			if tc.err != nil {
+				return
+			}
+			if body.Screenshot.MimeType != "image/png" || body.Screenshot.Data != "iVBORw0KGgo=" || body.ContentHeight != 412 {
+				t.Fatalf("body = %+v", body)
+			}
+			if svc.checkInput.Width != 390 || svc.checkInput.BaseURL != srv.URL {
+				t.Fatalf("input = %+v", svc.checkInput)
+			}
+		})
+	}
+}
+```
+
+- [ ] **Step 6: Implement the route**
+
+DTOs in `dto.go`:
+
+```go
+// RenderCheckRequest is a page an agent wants to see before it publishes it.
+type RenderCheckRequest struct {
+	HTML  string `json:"html" description:"A complete, self-contained HTML document, at most 1 MiB."`
+	Width int    `json:"width,omitempty" description:"Viewport width in CSS pixels, 240-1600. Defaults to 720."`
+}
+
+// RenderCheckScreenshot is the page as the desktop app drew it.
+type RenderCheckScreenshot struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data" description:"Base64 PNG."`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+}
+
+// RenderConsoleMessage is one console line the page wrote while it loaded.
+type RenderConsoleMessage struct {
+	Level string `json:"level" enum:"debug,log,warning,error"`
+	Text  string `json:"text"`
+}
+
+// RenderCheckResponse reports how the page rendered.
+type RenderCheckResponse struct {
+	Screenshot      RenderCheckScreenshot  `json:"screenshot"`
+	ContentHeight   int                    `json:"contentHeight" description:"Height the page needs at this width, in CSS pixels."`
+	ConsoleMessages []RenderConsoleMessage `json:"consoleMessages"`
+}
+```
+
+Handler in `conversation_render.go`:
+
+```go
+type renderChecker interface {
+	CheckRender(context.Context, domain.SessionID, chatsvc.RenderCheckInput) (chatsvc.RenderCheckResult, error)
+}
+
+func (c *ConversationsController) checkRender(w http.ResponseWriter, r *http.Request) {
+	svc, ok := c.Svc.(renderChecker)
+	if !ok {
+		apispec.NotImplemented(w, r, "POST", "/api/v1/sessions/{sessionId}/renders/check")
+		return
+	}
+	var req RenderCheckRequest
+	if !decodeConversationBody(w, r, &req) {
+		return
+	}
+	// The desktop app loads the page from the origin the CLI reached: the
+	// loopback listener (preview hosts never reach this route).
+	result, err := svc.CheckRender(r.Context(), sessionID(r), chatsvc.RenderCheckInput{
+		HTML: req.HTML, Width: req.Width, BaseURL: "http://" + r.Host,
+	})
+	switch {
+	case err == nil:
+		messages := make([]RenderConsoleMessage, 0, len(result.ConsoleMessages))
+		for _, m := range result.ConsoleMessages {
+			messages = append(messages, RenderConsoleMessage{Level: m.Level, Text: m.Text})
+		}
+		envelope.WriteJSON(w, http.StatusOK, RenderCheckResponse{
+			Screenshot:      RenderCheckScreenshot{MimeType: "image/png", Data: result.PNG, Width: result.Width, Height: result.Height},
+			ContentHeight:   result.ContentHeight,
+			ConsoleMessages: messages,
+		})
+	case errors.Is(err, chatsvc.ErrRenderInvalid):
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "RENDER_INVALID", err.Error(), nil)
+	case errors.Is(err, chatsvc.ErrRenderCheckUnavailable):
+		envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "RENDER_CHECK_UNAVAILABLE",
+			"render check needs the AO desktop app; open it, or publish without a check", nil)
+	default:
+		writeConversationError(w, r, err)
+	}
+}
+```
+
+Route in `Register`, before the `{renderId}` GET:
+
+```go
+	r.Post("/sessions/{sessionId}/renders/check", c.checkRender)
+```
+
+Spec operation (next to `publishSessionRender`) and schema names:
+
+```go
+		{
+			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/renders/check", id: "checkSessionRender", tag: "conversations",
+			summary:    "Screenshot an agent's HTML page in the desktop app before it is published",
+			pathParams: []any{controllers.SessionIDParam{}},
+			reqBody:    controllers.RenderCheckRequest{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.RenderCheckResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusServiceUnavailable, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+```
+
+```go
+	"ControllersRenderCheckRequest":    "RenderCheckRequest",
+	"ControllersRenderCheckResponse":   "RenderCheckResponse",
+	"ControllersRenderCheckScreenshot": "RenderCheckScreenshot",
+	"ControllersRenderConsoleMessage":  "RenderConsoleMessage",
+```
+
+Run: `npm run api && cd backend && go test ./internal/httpd/... ./internal/service/chat/ ./internal/daemon/`
+Expected: PASS.
+
+- [ ] **Step 7: Write the failing Electron test** (`frontend/src/main/render-check.test.ts`)
+
+```ts
+import { describe, expect, it, vi } from "vitest";
+import { checkRender } from "./render-check";
+
+const url = "http://127.0.0.1:3001/api/v1/sessions/p-1/renders/check-id-001";
+
+function fakes(options: { loadError?: Error } = {}) {
+	const listeners = new Map<string, (...args: unknown[]) => void>();
+	const permissionRequest = vi.fn();
+	const contents = {
+		session: {
+			setPermissionRequestHandler: (handler: (...args: unknown[]) => void) => permissionRequest.mockImplementation(handler),
+			setPermissionCheckHandler: vi.fn(),
+		},
+		setWindowOpenHandler: vi.fn(),
+		on: (event: string, listener: (...args: unknown[]) => void) => listeners.set(event, listener),
+		loadURL: vi.fn(async () => {
+			if (options.loadError) throw options.loadError;
+			listeners.get("console-message")?.({}, 3, "Uncaught ReferenceError: d3 is not defined", 1, url);
+		}),
+		executeJavaScript: vi.fn(async () => 412),
+		debugger: {
+			attach: vi.fn(),
+			sendCommand: vi.fn(async () => ({ data: "iVBORw0KGgo=" })),
+			detach: vi.fn(),
+		},
+		close: vi.fn(),
+	};
+	const view = { webContents: contents, setBounds: vi.fn() };
+	// A function, not an arrow: checkRender calls it with `new` (vitest 4 rejects arrow constructors).
+	const WebContentsView = vi.fn(function () {
+		return view;
+	});
+	const window = { contentView: { addChildView: vi.fn(), removeChildView: vi.fn() } };
+	return { contents, view, WebContentsView, window, permissionRequest };
+}
+
+describe("checkRender", () => {
+	it("loads only daemon render-check URLs", async () => {
+		const f = fakes();
+		await expect(checkRender(f as never, { url: "https://example.com/", width: 720 })).rejects.toThrow(/render-check URL/);
+		await expect(checkRender(f as never, { url: url.replace("check-", ""), width: 720 })).rejects.toThrow(/render-check URL/);
+		expect(f.WebContentsView).not.toHaveBeenCalled();
+	});
+
+	it("returns the screenshot, height, and console, in a sandboxed throwaway view", async () => {
+		const f = fakes();
+		const result = await checkRender(f as never, { url, width: 390 });
+		expect(result).toEqual({
+			data: "iVBORw0KGgo=",
+			width: 390,
+			height: 412,
+			contentHeight: 412,
+			consoleMessages: [{ level: "error", text: "Uncaught ReferenceError: d3 is not defined" }],
+		});
+		const prefs = f.WebContentsView.mock.calls[0][0].webPreferences;
+		expect(prefs).toMatchObject({ sandbox: true, contextIsolation: true, nodeIntegration: false });
+		expect(prefs.partition).toMatch(/^ao-render-check-/);
+		const decide = vi.fn();
+		f.permissionRequest({}, "media", decide);
+		expect(decide).toHaveBeenCalledWith(false);
+		expect(f.window.contentView.removeChildView).toHaveBeenCalledWith(f.view);
+		expect(f.contents.close).toHaveBeenCalled();
+	});
+
+	it("removes the view when the page fails to load", async () => {
+		const f = fakes({ loadError: new Error("ERR_CONNECTION_REFUSED") });
+		await expect(checkRender(f as never, { url, width: 720 })).rejects.toThrow(/ERR_CONNECTION_REFUSED/);
+		expect(f.window.contentView.removeChildView).toHaveBeenCalledWith(f.view);
+		expect(f.contents.close).toHaveBeenCalled();
+	});
+});
+```
+
+- [ ] **Step 8: Run it to verify it fails**
+
+Run: `cd frontend && npx vitest run --config vite.renderer.config.ts src/main/render-check.test.ts`
+Expected: FAIL because module `./render-check` not found.
+
+- [ ] **Step 9: Write `render-check.ts`**
+
+```ts
+import { randomUUID } from "node:crypto";
+import type { BaseWindow, WebContentsView } from "electron";
+
+export type RenderCheckMessage = { level: "debug" | "log" | "warning" | "error"; text: string };
+export type RenderCheckResult = {
+	data: string;
+	width: number;
+	height: number;
+	contentHeight: number;
+	consoleMessages: RenderCheckMessage[];
+};
+
+type RenderCheckDeps = {
+	WebContentsView: typeof WebContentsView;
+	window: Pick<BaseWindow, "contentView">;
+};
+
+// Only the daemon's own temporary render-check pages; never an arbitrary URL.
+const RENDER_CHECK_URL = /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1\/sessions\/[^/]+\/renders\/check-[A-Za-z0-9_-]+$/;
+// Chromium console levels 0-3: verbose (console.debug), info (console.log), warning, error.
+const LEVELS = ["debug", "log", "warning", "error"] as const;
+const MAX_MESSAGES = 20;
+const MAX_MESSAGE_CHARS = 500;
+const MAX_CAPTURE_HEIGHT = 2_000;
+const LOAD_TIMEOUT_MS = 15_000;
+// ponytail: fixed settle for CDN scripts and first animation frames; wait on network idle if pages race it.
+const SETTLE_MS = 300;
+
+function renderCheckError(code: string, message: string): Error & { code: string } {
+	return Object.assign(new Error(message), { code });
+}
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(resolve, ms);
+		signal?.addEventListener("abort", () => {
+			clearTimeout(timer);
+			reject(renderCheckError("BROWSER_COMMAND_CANCELED", "render check canceled"));
+		}, { once: true });
+	});
+}
+
+/**
+ * Loads an agent's page in a throwaway hidden view, the way readers will see
+ * it, and returns a screenshot, the content height, and console output. The
+ * view never joins the user's Browser panel: in-memory partition, sandboxed,
+ * no permissions, no popups, no navigation away. CDP captures it while it is
+ * offscreen.
+ */
+export async function checkRender(
+	deps: RenderCheckDeps,
+	args: Record<string, unknown>,
+	signal?: AbortSignal,
+): Promise<RenderCheckResult> {
+	const { url, width } = args;
+	if (typeof url !== "string" || !RENDER_CHECK_URL.test(url)) {
+		throw renderCheckError("INVALID_ARGUMENT", "render check needs a daemon render-check URL");
+	}
+	if (typeof width !== "number" || !Number.isInteger(width) || width < 240 || width > 1_600) {
+		throw renderCheckError("INVALID_ARGUMENT", "render check width must be an integer from 240 to 1600");
+	}
+	const view = new deps.WebContentsView({
+		webPreferences: {
+			contextIsolation: true,
+			nodeIntegration: false,
+			sandbox: true,
+			backgroundThrottling: false,
+			// No "persist:" prefix: Electron keeps this partition in memory only.
+			partition: `ao-render-check-${randomUUID()}`,
+		},
+	});
+	const contents = view.webContents;
+	const consoleMessages: RenderCheckMessage[] = [];
+	contents.session.setPermissionRequestHandler((_contents, _permission, decide) => decide(false));
+	contents.session.setPermissionCheckHandler(() => false);
+	contents.setWindowOpenHandler(() => ({ action: "deny" }));
+	contents.on("will-navigate", (event) => event.preventDefault());
+	contents.on("console-message", (_event, level, message) => {
+		if (consoleMessages.length >= MAX_MESSAGES) return;
+		consoleMessages.push({ level: LEVELS[level] ?? "log", text: message.slice(0, MAX_MESSAGE_CHARS) });
+	});
+	view.setBounds({ x: -10_000, y: -10_000, width, height: 800 });
+	deps.window.contentView.addChildView(view);
+	try {
+		await Promise.race([
+			contents.loadURL(url),
+			wait(LOAD_TIMEOUT_MS, signal).then(() => {
+				throw renderCheckError("BROWSER_COMMAND_FAILED", `render check page did not load within ${LOAD_TIMEOUT_MS} ms`);
+			}),
+		]);
+		await wait(SETTLE_MS, signal);
+		const contentHeight = Number(
+			await contents.executeJavaScript(
+				"Math.ceil(Math.max(document.documentElement.scrollHeight, document.documentElement.getBoundingClientRect().height))",
+			),
+		);
+		const height = Math.min(Math.max(contentHeight, 1), MAX_CAPTURE_HEIGHT);
+		view.setBounds({ x: -10_000, y: -10_000, width, height });
+		contents.debugger.attach("1.3");
+		try {
+			const shot = (await contents.debugger.sendCommand("Page.captureScreenshot", {
+				format: "png",
+				clip: { x: 0, y: 0, width, height, scale: 1 },
+			})) as { data: string };
+			return { data: shot.data, width, height, contentHeight, consoleMessages };
+		} finally {
+			contents.debugger.detach();
+		}
+	} finally {
+		deps.window.contentView.removeChildView(view);
+		contents.close();
+	}
+}
+```
+
+The load-timeout `wait` keeps a 15 s timer after a successful load. That is acceptable, because it only rejects into a settled race. If lint objects, swap it for a `setTimeout` handle that `finally` clears.
+
+- [ ] **Step 10: Route the action in `main.ts`** (`connectBrowserRuntime(..., { execute })`, line 1327)
+
+```ts
+		execute: (command, signal) => {
+			// A render check uses a throwaway hidden view, never the session's
+			// Browser panel, so it does not need (or disturb) the view host.
+			if (command.action === "__render-check") {
+				if (!mainWindow) {
+					throw Object.assign(new Error("AO window is unavailable"), { code: "BROWSER_TARGET_UNAVAILABLE" });
+				}
+				return checkRender({ WebContentsView, window: mainWindow }, command.args ?? {}, signal);
+			}
+			const host = browserViewHost;
+```
+
+Import `checkRender` from `./main/render-check`.
+
+Run: `cd frontend && npx vitest run --config vite.renderer.config.ts src/main/render-check.test.ts && npm run typecheck`
+Expected: PASS. `command.args` is optional (`browser-runtime-link.ts:15`), hence the `?? {}`.
+
+- [ ] **Step 11: Write the failing CLI test** (append to `cli/render_test.go`)
+
+```go
+func TestRenderCheckWritesTheScreenshotAndPrintsConsole(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "aa-47")
+	cfg := setConfigEnv(t)
+	srv, capture := renderServer(t, http.StatusOK,
+		`{"screenshot":{"mimeType":"image/png","data":"iVBORw0KGgo=","width":390,"height":412},"contentHeight":412,`+
+			`"consoleMessages":[{"level":"error","text":"Uncaught ReferenceError: d3 is not defined"}]}`)
+	writeRunFileFor(t, cfg, srv)
+	out := filepath.Join(t.TempDir(), "check.png")
+
+	stdout, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }},
+		"render", "--check", writePage(t, []byte("<p>chart</p>")), "--width", "390", "--out", out)
+	if err != nil {
+		t.Fatalf("render --check: %v\nstderr=%s", err, errOut)
+	}
+	if capture.path != "/api/v1/sessions/aa-47/renders/check" || !strings.Contains(capture.body, `"width":390`) {
+		t.Fatalf("hit %s with %s", capture.path, capture.body)
+	}
+	if png, err := os.ReadFile(out); err != nil || len(png) == 0 {
+		t.Fatalf("screenshot not written: %v", err)
+	}
+	for _, want := range []string{out, "412", "console.error: Uncaught ReferenceError: d3 is not defined"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+```
+
+Run: `cd backend && go test ./internal/cli/ -run RenderCheck -v`
+Expected: FAIL, because `--check` is an unknown flag.
+
+- [ ] **Step 12: Implement `--check` in `cli/render.go`**
+
+Replace the `MarkFlagRequired("title")` line and the `RunE` body. Change the `--title` usage to `"short name for the page (required unless --check)"`. Add three flags and a check path:
+
+```go
+	var check bool
+	var width int
+	var out string
+	// RunE:
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if check {
+				return ctx.checkRender(cmd, args[0], width, out)
+			}
+			if strings.TrimSpace(title) == "" {
+				return usageError{errors.New("--title is required unless --check is set")}
+			}
+			return ctx.publishRender(cmd.Context(), cmd.OutOrStdout(), args[0], title, height)
+		},
+	// flags:
+	cmd.Flags().BoolVar(&check, "check", false, "screenshot the page in the AO desktop app instead of publishing it")
+	cmd.Flags().IntVar(&width, "width", 720, "with --check: viewport width in CSS pixels, 240-1600; use 390 for phones")
+	cmd.Flags().StringVar(&out, "out", "", "with --check: PNG path to write (default: a new file in the temp directory)")
+```
+
+```go
+type renderCheckAPIRequest struct {
+	HTML  string `json:"html"`
+	Width int    `json:"width"`
+}
+
+type renderCheckAPIResponse struct {
+	Screenshot struct {
+		Data   string `json:"data"`
+		Width  int    `json:"width"`
+		Height int    `json:"height"`
+	} `json:"screenshot"`
+	ContentHeight   int `json:"contentHeight"`
+	ConsoleMessages []struct {
+		Level string `json:"level"`
+		Text  string `json:"text"`
+	} `json:"consoleMessages"`
+}
+
+func (c *commandContext) checkRender(cmd *cobra.Command, file string, width int, out string) error {
+	sessionID := strings.TrimSpace(os.Getenv("AO_SESSION_ID"))
+	if sessionID == "" {
+		return usageError{errors.New("ao render must run inside an AO chat session (AO_SESSION_ID is not set)")}
+	}
+	html, err := readRenderFile(file)
+	if err != nil {
+		return err
+	}
+	var resp renderCheckAPIResponse
+	path := "sessions/" + url.PathEscape(sessionID) + "/renders/check"
+	if err := c.postJSON(cmd.Context(), path, renderCheckAPIRequest{HTML: html, Width: width}, &resp); err != nil {
+		return err
+	}
+	if out == "" {
+		out = filepath.Join(os.TempDir(), fmt.Sprintf("ao-render-check-%d.png", time.Now().UnixNano()))
+	}
+	shot := map[string]any{"data": resp.Screenshot.Data, "width": resp.Screenshot.Width, "height": resp.Screenshot.Height}
+	if err := writeBrowserScreenshot(cmd, shot, out, false, false); err != nil {
+		return err
+	}
+	w := cmd.OutOrStdout()
+	if _, err := fmt.Fprintf(w, "Content height: %d px at width %d.\n", resp.ContentHeight, width); err != nil {
+		return err
+	}
+	for _, m := range resp.ConsoleMessages {
+		if _, err := fmt.Fprintf(w, "console.%s: %s\n", m.Level, m.Text); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+Extract the stat, size-check and read steps from `publishRender` (Task 5) into `readRenderFile(file string) (string, error)`, and call it from both paths. `writeBrowserScreenshot` already prints the saved path, refuses to overwrite, and writes mode 0600 (`cli/browser.go:990`).
+
+Append this to the CLI `Long` help, after `"terminal session use `ao preview` instead."`:
+
+```go
+			"\n\nRun `ao render --check <file>` first: the AO desktop app returns a\n" +
+			"screenshot, the page's content height, and its console messages.",
+```
+
+Add a "Check before you publish" section to `commands/render.md`, after "Rules":
+
+```markdown
+## Check before you publish
+
+Run `ao render --check <file>` first. It loads the page in the AO desktop app
+the way readers see it and writes a PNG. It prints the page's content height
+and its console messages. Read the PNG. Fix every `console.error` line. Use the
+content height as `--height`. Use `--width 390` to check a phone layout. The
+check needs the desktop app. Without it, publish without a check.
+```
+
+Replace the old "Checking a page" section (the `ao preview` workaround) with this one.
+
+- [ ] **Step 13: Run all affected suites**
+
+Run: `cd backend && go test ./internal/cli/ ./internal/service/chat/ ./internal/httpd/... ./internal/daemon/ ./internal/skillassets/ && cd ../frontend && npx vitest run --config vite.renderer.config.ts src/main/ && npm run typecheck`
+Expected: PASS.
+
+- [ ] **Step 14: Commit**
+
+```bash
+git add backend/ frontend/src/main/ frontend/src/main.ts frontend/src/api/schema.ts
+git commit -m "feat(cli): ao render --check screenshots a page in a hidden desktop view"
+```
+
+---
+
+### Task 9: Real-app verification and the CI suites
 
 **Files:** none. If a fix is needed, the changes belong to the task that owns the code.
 
@@ -2029,15 +2807,16 @@ Expected: all green. Report any job that cannot run locally by name, and verify 
 
 - [ ] **Step 3: Exercise the feature end to end.**
   1. Start a Codex chat session and ask: "Render a bar chart of the files in this repo by extension, inline in the thread."
-  2. Expect the agent to write a file under `$TMPDIR`, run `ao render`, and reply without restating the chart. The chart should appear above the reply, borderless, aligned with the reply text, with no scrollbar.
+  2. Expect the agent to write a file under `$TMPDIR`, run `ao render --check` and read the PNG, then run `ao render`. Expect it to reply without restating the chart. The chart should appear above the reply, borderless, aligned with the reply text, with no scrollbar.
   3. Repeat with a Claude chat session, which goes through the ACP driver.
-  4. Toggle light/dark. Expect the chart to restyle in place with no reload flash.
-  5. Hover the chart and press the expand control. The dialog shows the page full size, and Esc restores focus to the control.
-  6. Click an `https://` link inside a page. It opens in the system browser, and the thread does not navigate.
-  7. In the frame's devtools console, run `location = "https://example.com"`. Expect the frame to stay put (Task 7). Then run `fetch("http://127.0.0.1:<port>/api/v1/sessions")`. Expect it to fail with 403 or a CORS error.
-  8. Check that the frame's `--background` matches the reply column's surface. If the thread sits on a different surface than `--color-bg-primary`, change that one mapping in `render-frame.ts` and the Go fallback.
-  9. Run `ao render page.html --title x` in a TUI session. Expect a `SESSION_MODE_MISMATCH` error.
-  10. Delete the session permanently. Expect `<AO_DATA_DIR>/attachments/<sessionId>/` to be gone.
+  4. Run `ao render --check` on a page that calls an undefined function. Expect a `console.error: Uncaught ReferenceError` line, and expect the Browser panel to stay untouched, with no activity badge. Quit the desktop app, run the check again, and expect `RENDER_CHECK_UNAVAILABLE`.
+  5. Toggle light/dark. Expect the chart to restyle in place with no reload flash.
+  6. Hover the chart and press the expand control. The dialog shows the page full size, and Esc restores focus to the control.
+  7. Click an `https://` link inside a page. It opens in the system browser, and the thread does not navigate.
+  8. In the frame's devtools console, run `location = "https://example.com"`. Expect the frame to stay put (Task 7). Then run `fetch("http://127.0.0.1:<port>/api/v1/sessions")`. Expect it to fail with 403 or a CORS error.
+  9. Check that the frame's `--background` matches the reply column's surface. If the thread sits on a different surface than `--color-bg-primary`, change that one mapping in `render-frame.ts` and the Go fallback.
+  10. Run `ao render page.html --title x` in a TUI session. Expect a `SESSION_MODE_MISMATCH` error.
+  11. Delete the session permanently. Expect `<AO_DATA_DIR>/attachments/<sessionId>/` to be gone.
 - [ ] **Step 4: Show it.** Run `ao preview` on a screenshot or the running app, per CLAUDE.md, and tell the user to check the Browser tab.
 - [ ] **Step 5: Open the PR** using `.agents/skills/pr-description/SKILL.md`. Include the Phase 2 list below as intentional omissions, and link the PR to this thread.
 
@@ -2045,12 +2824,11 @@ Expected: all green. Report any job that cannot run locally by name, and verify 
 
 ## Phase 2 (deferred, each its own PR)
 
-1. **`ao render --check <file>`.** Returns a screenshot, console output and content height from an offscreen Electron `WebContents` through the existing `ao browser` broker. This is AO's `html_preview`, with no 120 MB Chrome download and no SOCKS proxy, but it requires the desktop app to be running.
-2. **Local image inlining in the CLI.** Absolute image paths become `data:` URIs. The CLI reads them with the agent's own permissions and checks magic bytes, like T3's `isImageBytes`. It raises the page cap to match `MaxFileBytes`.
-3. **Height measured at publish**, to remove the small resize after load. This needs (1).
-4. **More actions in the expand dialog:** open in browser, view source, save.
-5. **Mobile/LAN clients.** The route is already behind `authMiddleware` on the LAN listener; mobile needs its own WebView frame.
-6. **Cloud sessions.** `CloudSessionChatSurface` builds its activities from cloud CP events and has no render route.
-7. **Hosting upstream MCP Apps.** The bootstrap already speaks `ui/*`.
-8. **An agent-requested scrolling frame**, i.e. T3's "a height below `contentHeight` caps the frame".
-9. **Render cleanup on rollback.** Files currently survive a rolled-back turn until the session is deleted.
+1. **Local image inlining in the CLI.** Absolute image paths become `data:` URIs. The CLI reads them with the agent's own permissions and checks magic bytes, like T3's `isImageBytes`. It raises the page cap to match `MaxFileBytes`.
+2. **Height measured at publish**, to remove the small resize after load. It reuses Task 8's hidden view.
+3. **More actions in the expand dialog:** open in browser, view source, save.
+4. **Mobile/LAN clients.** The route is already behind `authMiddleware` on the LAN listener; mobile needs its own WebView frame.
+5. **Cloud sessions.** `CloudSessionChatSurface` builds its activities from cloud CP events and has no render route.
+6. **Hosting upstream MCP Apps.** The bootstrap already speaks `ui/*`.
+7. **An agent-requested scrolling frame**, i.e. T3's "a height below `contentHeight` caps the frame".
+8. **Render cleanup on rollback.** Files currently survive a rolled-back turn until the session is deleted.
