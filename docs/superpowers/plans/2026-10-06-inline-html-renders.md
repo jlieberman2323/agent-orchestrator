@@ -1405,6 +1405,17 @@ ao render "$TMPDIR/turns-by-day.html" --title "Turns by day" --height 420
   page's real height.
 - Chat sessions only. In a terminal session, open the file with `ao preview`.
 
+## ao render or the Browser panel
+
+Use `ao render` when the page is the answer: a chart, table, diagram, or
+mockup that you make from data you already have. The page stays in the thread.
+
+Use `ao preview` and `ao browser` when the page is the work: an app that runs,
+a page that needs a server or a login, or a page that you must click through.
+The Browser panel shows the live page, and the next preview replaces it.
+
+If the user must still read the page after the dev server stops, use `ao render`.
+
 ## Layout
 
 - The frame is borderless on the thread background, as wide as the reply column,
